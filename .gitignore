@@ -9,7 +9,7 @@
 *.obj
 *.a
 *.gch
-.ply
+*.ply
 !assets/video0.mp4
 !assets/video1.mp4
 !assets/video2.mp4
