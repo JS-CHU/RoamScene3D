@@ -1,0 +1,13 @@
+MODEL:
+    DEVICE: 'cuda'
+    SAM:
+        CFG_PATH: './pano_segment/config/sam.yaml'
+    CLIP:
+        CFG_PATH: './pano_segment/config/clip.yaml'
+INS_SEG:
+    MAX_INPUT_SIZE: [2048, 2048]
+    TOP_K_MASK_COUNT: 1000
+    CLS_SCORE_THRESH: 0.6
+LOG:
+    SAVE_DIR: './log'
+    LEVEL: INFO
