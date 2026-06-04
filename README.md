@@ -44,23 +44,13 @@ Given a text prompt, RoamScene3D first initializes the scene with a generated RG
 
 ## Videos
 
-<table>
-  <tr>
-    <td align="center"><video src="assets/video0.mp4" controls muted playsinline width="100%"></video></td>
-    <td align="center"><video src="assets/video1.mp4" controls muted playsinline width="100%"></video></td>
-    <td align="center"><video src="assets/video2.mp4" controls muted playsinline width="100%"></video></td>
-  </tr>
-  <tr>
-    <td align="center"><video src="assets/video3.mp4" controls muted playsinline width="100%"></video></td>
-    <td align="center"><video src="assets/video4.mp4" controls muted playsinline width="100%"></video></td>
-    <td align="center"><video src="assets/video5.mp4" controls muted playsinline width="100%"></video></td>
-  </tr>
-  <tr>
-    <td align="center"><video src="assets/video6.mp4" controls muted playsinline width="100%"></video></td>
-    <td align="center"><video src="assets/video7.mp4" controls muted playsinline width="100%"></video></td>
-    <td align="center"><video src="assets/video8.mp4" controls muted playsinline width="100%"></video></td>
-  </tr>
-</table>
+GitHub does not render inline HTML video players in repository README pages. Please click the links below to open the uploaded demo videos directly.
+
+| Demo | Link | Demo | Link | Demo | Link |
+|---|---|---|---|---|---|
+| Video 0 | [video0.mp4](assets/video0.mp4) | Video 1 | [video1.mp4](assets/video1.mp4) | Video 2 | [video2.mp4](assets/video2.mp4) |
+| Video 3 | [video3.mp4](assets/video3.mp4) | Video 4 | [video4.mp4](assets/video4.mp4) | Video 5 | [video5.mp4](assets/video5.mp4) |
+| Video 6 | [video6.mp4](assets/video6.mp4) | Video 7 | [video7.mp4](assets/video7.mp4) | Video 8 | [video8.mp4](assets/video8.mp4) |
 
 ## Getting Started
 
