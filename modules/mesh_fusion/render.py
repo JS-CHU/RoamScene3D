@@ -215,7 +215,7 @@ def features_to_world_space_mesh(colors, depth, fov_in_degrees, world_to_cam, ma
     if using_distance_map:
         world_space_points = unproject_points_distance(depth.cpu())
         world_space_points = torch.Tensor(world_space_points).permute(1,0).cuda() # [3,N]
-        world_space_points -= world_to_cam[:3,3].unsqueeze(-1).repeat(1, world_space_points.shape[1])
+        world_space_points = world_to_cam[:3, :3].T @ (world_space_points-world_to_cam[:3, 3:4])
     else:
         world_space_points = unproject_points(world_to_cam, fov_in_degrees, depth, H, W)
     pc = world_space_points
@@ -226,10 +226,18 @@ def features_to_world_space_mesh(colors, depth, fov_in_degrees, world_to_cam, ma
     10---11
     '''
     vertex_ids = torch.arange(H*W).reshape(H, W).to(colors.device)
-    vertex_00 = remapped_vertex_00 = vertex_ids[:H-1, :W-1]
-    vertex_01 = remapped_vertex_01 = (remapped_vertex_00 + 1)
-    vertex_10 = remapped_vertex_10 = (remapped_vertex_00 + W)
-    vertex_11 = remapped_vertex_11 = (remapped_vertex_00 + W + 1)
+    if using_distance_map:
+        vertex_00 = remapped_vertex_00 = vertex_ids[:-1]
+        vertex_01 = remapped_vertex_01 = vertex_ids[:-1].roll(-1, dims=1)
+        vertex_10 = remapped_vertex_10 = vertex_ids[1:]
+        vertex_11 = remapped_vertex_11 = vertex_ids[1:].roll(-1, dims=1)
+    else:
+        vertex_00 = remapped_vertex_00 = vertex_ids[:-1, :-1]
+        vertex_01 = remapped_vertex_01 = vertex_00+1
+        vertex_10 = remapped_vertex_10 = vertex_00+W
+        vertex_11 = remapped_vertex_11 = vertex_00+W+1
+    valid_depth = torch.isfinite(depth) & (depth > 1e-5)
+    mask = valid_depth if mask is None else (mask.bool() & valid_depth)
 
     if mask is not None:
         def dilate(x, k=3):
@@ -256,7 +264,7 @@ def features_to_world_space_mesh(colors, depth, fov_in_degrees, world_to_cam, ma
         remap = torch.bucketize(vertex_ids, vertex_ids[mask_dilated])
         remap[~mask_dilated] = -1  # mark invalid vertex_ids with -1 --> due to dilation + triangulation, a few faces will contain -1 values --> need to filter them
         remap = remap.flatten()
-        mask_dilated = mask_dilated[:H-1, :W-1]
+        mask_dilated = mask_dilated[:-1] if using_distance_map else mask_dilated[:-1, :-1]
         vertex_00 = vertex_00[mask_dilated]
         vertex_01 = vertex_01[mask_dilated]
         vertex_10 = vertex_10[mask_dilated]
@@ -291,7 +299,7 @@ def features_to_world_space_mesh(colors, depth, fov_in_degrees, world_to_cam, ma
         colors,
         edge_threshold=edge_threshold,
         min_triangles_connected=-1,
-        fill_holes=True
+        fill_holes=False
     )
 
     return world_space_points, faces, colors, pc

@@ -314,8 +314,7 @@ class FIDInceptionE_2(models.inception.InceptionE):
 
         # Patch: The FID Inception model uses max pooling instead of average
         # pooling. This is likely an error in this specific Inception
-        # implementation, as other Inception models use average pooling here
-        # (which matches the description in the paper).
+        # implementation, as other Inception models use average pooling here.
         branch_pool = F.max_pool2d(x, kernel_size=3, stride=1, padding=1)
         branch_pool = self.branch_pool(branch_pool)
 

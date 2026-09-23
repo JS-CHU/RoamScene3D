@@ -1,6 +1,6 @@
 MODEL:
     MODEL_NAME: 'vit_h'  # only support ['vit_h', 'vit_l', 'vit_b', 'vit_t', 'default']
-    CKPT_PATH: './pano_segment/pretrained/sam/sam_vit_h_4b8939.pth'
+    CKPT_PATH: './checkpoint/sam_vit_h_4b8939.pth'
     DEVICE: 'cuda'
 MASK_GENERATOR:
     PTS_PER_SIDE: 32

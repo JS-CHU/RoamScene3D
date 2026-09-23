@@ -43,7 +43,7 @@ def build_sam_mask_generator(cfg):
     points_per_batch = cfg.MASK_GENERATOR.PTS_PER_BATCH
     pred_iou_thresh = cfg.MASK_GENERATOR.PRED_IOU_THRESH
     stability_score_thresh = cfg.MASK_GENERATOR.STABILITY_SCORE_THRESH
-    stability_score_offset = cfg.MASK_GENERATOR.STABILITY_SCORE_THRESH
+    stability_score_offset = cfg.MASK_GENERATOR.STABILITY_SCORE_OFFSET
     box_nms_thresh = cfg.MASK_GENERATOR.BOX_NMS_THRESH
     crop_n_layers = cfg.MASK_GENERATOR.CROP_N_LAYERS
     crop_nms_thresh = cfg.MASK_GENERATOR.CROP_NMS_THRESH

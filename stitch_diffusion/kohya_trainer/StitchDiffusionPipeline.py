@@ -218,8 +218,7 @@ class PipelineLike:
                 expense of slower inference.
             guidance_scale (`float`, *optional*, defaults to 7.5):
                 Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
-                `guidance_scale` is defined as `w` of equation 2. of [Imagen
-                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                Guidance scale is enabled by setting `guidance_scale >
                 1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
                 usually at the expense of lower image quality.
             strength (`float`, *optional*, defaults to 0.8):
@@ -231,7 +230,7 @@ class PipelineLike:
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                Controls DDIM sampling stochasticity. Only applies to
                 [`schedulers.DDIMScheduler`], will be ignored for others.
             generator (`torch.Generator`, *optional*):
                 A [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation
@@ -296,9 +295,7 @@ class PipelineLike:
 
         # get prompt text embeddings
 
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
+        # Enable classifier-free guidance when guidance_scale exceeds 1.
         do_classifier_free_guidance = guidance_scale > 1.0
 
         if not do_classifier_free_guidance and negative_scale is not None:

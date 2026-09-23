@@ -23,6 +23,11 @@ class Args:
 class SDFTInpainter(Inpainter):
     def __init__(self, model, SDFT_path, step):
         super().__init__()
+        ckpt_path = os.environ.get('ROAM_MOTION_CHECKPOINT',
+                                  os.path.join(SDFT_path, f'checkpoint-step-{step}', 'unet.pth'))
+        if model != 'origin' and not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f'Missing trained motion-inpainting weights: {ckpt_path}. '
+                                    'Set ROAM_MOTION_CHECKPOINT; random motion weights are not a valid fallback.')
         args = Args()
         if model == 'wocam':
             UNet = UNetWOCam(args)
@@ -30,21 +35,26 @@ class SDFTInpainter(Inpainter):
             UNet = UNetWithCam(args)
         # SDFT_path = f"output/lora1"
         if not model == 'origin':
-            if os.path.exists(SDFT_path):
-                ckpt_path = os.path.join(SDFT_path, f'checkpoint-step-{step}', 'unet.pth')
-                state_dict = torch.load(ckpt_path, map_location='cuda')
+            state_dict = torch.load(ckpt_path, map_location='cpu')
+            try:
                 UNet.load_state_dict(state_dict)
-            UNet.to('cuda')
+            except RuntimeError as error:
+                raise RuntimeError('Checkpoint must match the six-DoF positional encoder. '
+                                   'Legacy position+face-direction weights require retraining.') from error
+            UNet.to('cuda').eval()
         pipe = StableDiffusionInpaintPipeline.from_pretrained(args.pretrained_model_name_or_path, local_files_only=True, variant="fp16").to("cuda") # torch_dtype=torch.float16
         if not model == 'origin':
             pipe.unet = UNet
-        # 绕过 __setattr__，直接在 __dict__ 中补齐执行设备属性
-        try:
-            pipe.__dict__['_execution_device'] = torch.device("cuda")
-            pipe.__dict__['device'] = torch.device("cuda")
-        except Exception:
-            pass
         self.inpaint_pipe = pipe
+
+    def _run_with_motion(self, pose, **kwargs):
+        # StableDiffusionInpaintPipeline has no `pose` argument. The wrapper UNet
+        # consumes this temporary condition on every denoising step.
+        self.inpaint_pipe.unet.motion_condition = pose
+        try:
+            return self.inpaint_pipe(**kwargs)
+        finally:
+            self.inpaint_pipe.unet.motion_condition = None
         
 
     @torch.no_grad()
@@ -60,17 +70,16 @@ class SDFTInpainter(Inpainter):
         
         # prompt_generator = Prompt(self.SceneGraph_path, label)
         # prompt = prompt_generator.prompt
-        prompt = ''
-        generator = torch.Generator(device="cuda").manual_seed(0)
+        prompt = label
+        generator = torch.Generator(device="cuda").manual_seed(torch.initial_seed())
 
-        inpainted_image_pil = self.inpaint_pipe(
+        inpainted_image_pil = self._run_with_motion(pose,
         prompt=prompt,
         image=rendered_image_pil,
         mask_image=inpaint_mask_pil,
         guidance_scale=7.5,
         num_inference_steps=30,  
         generator=generator,
-        pose = pose
         ).images[0]
         result = functions.pil_to_tensor(inpainted_image_pil)
 
@@ -86,18 +95,16 @@ class SDFTInpainter(Inpainter):
             pil_img = functions.tensor_to_pil(imgs_b[b][None])
             images_pil.append(pil_img)
             masks_pil.append(mask_pil)
-        generator = torch.Generator(device="cuda").manual_seed(0)
+        generator = torch.Generator(device="cuda").manual_seed(torch.initial_seed())
         # prompt 与 batch 对齐，避免 2*B vs B 的维度不一致
-        prompt = [''] * B
-        result_pil_list = self.inpaint_pipe(
+        prompt = [label] * B
+        result_pil_list = self._run_with_motion(poses_b,
             prompt=prompt,
             image=images_pil,
             mask_image=masks_pil,
             guidance_scale=7.5,
             num_inference_steps=30,
-            generator=generator,
-            pose=poses_b
+            generator=generator
         ).images
         result_tensors = [functions.pil_to_tensor(pil_img) for pil_img in result_pil_list]
         return torch.cat(result_tensors, dim=0).to(torch.float32)
-    

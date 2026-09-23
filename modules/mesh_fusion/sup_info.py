@@ -39,7 +39,7 @@ class PanoSupInfo(SupInfo):
             distance_map = torch.ones([height, width, 1], device=color_map.device)
         else:
             distance_map = distance_map.squeeze()[..., None]
-        mask = mask.squeeze()[..., None]
+        mask = torch.ones_like(distance_map) if mask is None else mask.squeeze()[..., None]
 
         has_normal_map = True
         if normal_map is None:
@@ -68,13 +68,11 @@ class PanoSupInfo(SupInfo):
         else:
             mask = (mask > .5)
 
-        mask = mask & (distance_map > 1e-5)
+        mask = mask & torch.isfinite(distance_map) & (distance_map > 1e-5)
         self.register_buffer('mask_raw', mask.clone())
 
         x_laplacian = kornia.filters.laplacian(distance_map[None].permute(0, 3, 1, 2), kernel_size=3)
         edge_mask = (x_laplacian.abs() < 0.01).float()
-        edge_mask = erosion(edge_mask, kernel=torch.ones(3, 3))
-        edge_mask = dilation(edge_mask, kernel=torch.ones(3, 3))
 
         mask = mask & (edge_mask[0] > .5).permute(1, 2, 0)
 
@@ -243,46 +241,24 @@ class SupInfoPool:
         return sup_rays[indices], sup_colors[indices], sup_distances[indices], sup_normals[indices]
 
     def geo_check(self, rays, distances):
-        '''
-        :param rays:
-        :param distances:
-        :return: mask, 1 -> OK! 0 -> conflict!
-        '''
-        pts = rays.o + rays.d * distances.squeeze()[..., None]
-        height, width = pts.shape[:2]
-        mask = torch.ones([height, width, 1])
+        """Require d_candidate - d_reference > 0 for every valid support."""
+        distances = distances.squeeze()
+        pts = rays.o + rays.d * distances[..., None]
+        keep = torch.isfinite(distances) & (distances > 1e-5)
+        for support in self.sup_infos:
+            local = apply_rot(pts-support.pose[:3, 3], support.pose[:3, :3].T)
+            candidate = torch.linalg.norm(local, dim=-1)
+            dirs = local / candidate.clamp_min(1e-8)[..., None]
+            coords = direction_to_img_coord(dirs).nan_to_num()
+            # Nearest sampling of distance AND validity avoids inventing surfaces
+            # by interpolating filtered pixels with zeros. Longitude is periodic.
+            row = (coords[..., 0]*support.height).long().clamp(0, support.height-1)
+            col = (coords[..., 1]*support.width).floor().long() % support.width
+            reference = support.distance_map[row, col, 0]
+            valid = support.mask[row, col, 0] & torch.isfinite(reference) & (reference > 1e-5)
+            keep &= ~valid | ((candidate-reference) > 0.)
+        return keep.float()
 
-        for pano_idx in range(len(self.sup_infos)):
-            sup_info = self.sup_infos[pano_idx]
-            sup_distance_map = sup_info.distance_map * sup_info.mask.float()
-
-            new_dirs = apply_rot(pts - sup_info.pose[:3, 3], sup_info.pose[:3, :3].T)
-            new_distances = torch.linalg.norm(new_dirs, 2, -1, True)
-            new_dirs /= new_distances
-            proj_coords = direction_to_img_coord(new_dirs)
-            sample_coords = img_coord_to_sample_coord(proj_coords)
-            proj_distances = F.grid_sample(sup_distance_map[None].permute(0, 3, 1, 2), sample_coords[None],
-                                           padding_mode='border')
-            proj_distances = proj_distances[0].permute(1, 2, 0)
-
-            bias = (proj_distances < new_distances).float()
-            mask.clamp_(min=None, max=bias)
-
-        # dilate mask
-        l_size = (9, 9)
-        s_size = (3, 3)
-
-        kernel_l = cv.getStructuringElement(cv.MORPH_ELLIPSE, l_size)
-        kernel_s = cv.getStructuringElement(cv.MORPH_ELLIPSE, s_size)
-        kernel_l = torch.from_numpy(kernel_l).to(torch.float32).to(mask.device)
-        kernel_s = torch.from_numpy(kernel_s).to(torch.float32).to(mask.device)
-
-        mask = (mask[None, :, :, :] > 0.5).float()
-        mask = mask.permute(0, 3, 1, 2)
-        mask = mask.permute(0, 2, 3, 1).contiguous().squeeze()
-        return mask
-
-    
     def gen_occ_grid(self, res):
         rays_o, rays_d = self.all_sup_rays.collapse()
         dis = self.all_sup_distances

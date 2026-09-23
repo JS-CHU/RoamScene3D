@@ -1563,7 +1563,7 @@ class FlashAttentionFunction(torch.autograd.function.Function):
     @staticmethod
     @torch.no_grad()
     def forward(ctx, q, k, v, mask, causal, q_bucket_size, k_bucket_size):
-        """Algorithm 2 in the paper"""
+        """Compute blockwise attention outputs."""
 
         device = q.device
         dtype = q.dtype
@@ -1643,7 +1643,7 @@ class FlashAttentionFunction(torch.autograd.function.Function):
     @staticmethod
     @torch.no_grad()
     def backward(ctx, do):
-        """Algorithm 4 in the paper"""
+        """Compute blockwise attention gradients."""
 
         causal, scale, mask, q_bucket_size, k_bucket_size = ctx.args
         q, k, v, o, l, m = ctx.saved_tensors

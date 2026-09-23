@@ -509,7 +509,7 @@ def get_camerapaths():
 
 def main():
     cam_path = 'headbanging_circle'
-    os.makedirs("poses_supplementary", exist_ok=True)
+    os.makedirs("evaluation_poses", exist_ok=True)
 
     if cam_path == 'lookaround':
         render_poses = generate_seed_lookaround()
@@ -572,11 +572,11 @@ def main():
 
     import json
     if cam_path=='llff':
-        train_json_path = f"poses_supplementary/{cam_path}_d{d}.json"
+        train_json_path = f"evaluation_poses/{cam_path}_d{d}.json"
     elif cam_path=='headbanging':
-        train_json_path = f"poses_supplementary/{cam_path}_r{round}.json"
+        train_json_path = f"evaluation_poses/{cam_path}_r{round}.json"
     else:
-        train_json_path = f"poses_supplementary/{cam_path}.json"
+        train_json_path = f"evaluation_poses/{cam_path}.json"
     
     with open(train_json_path, 'w') as outfile:
         json.dump(blender_train_json, outfile, indent=4)

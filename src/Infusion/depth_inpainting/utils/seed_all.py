@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # --------------------------------------------------------------------------
-# If you find this code useful, we kindly ask you to cite our paper in your work.
 # Please find bibtex at: https://github.com/prs-eth/Marigold#-citation
 # More information about the method can be found at https://marigoldmonodepth.github.io
 # --------------------------------------------------------------------------

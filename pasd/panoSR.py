@@ -237,7 +237,7 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
         print(f"base_dir:{base_dir}")
         image_names = []
         for item in os.listdir(base_dir):
-            if item.startswith('32.png') and item.endswith(".png"):
+            if item.startswith('inpainted_pano_') and item.endswith(".png"):
             # if item == "livingroom.png":
                 image_path = f"{base_dir}/{item}"
                 image_names.append(image_path)
@@ -293,9 +293,6 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
             #     continue
 
             if args.control_type=="realisr": 
-                if True: #args.conditioning_scale < 1.0:
-                    image = wavelet_color_fix(image, validation_image)
-
                 if resize_flag: 
                     image = image.resize((ori_width*rscale, ori_height*rscale))
 

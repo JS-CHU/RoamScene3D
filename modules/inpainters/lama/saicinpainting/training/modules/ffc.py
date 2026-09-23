@@ -1,6 +1,5 @@
 # Fast Fourier Convolution NeurIPS 2020
 # original implementation https://github.com/pkumivision/FFC/blob/main/model_zoo/ffc.py
-# paper https://proceedings.neurips.cc/paper/2020/file/2fd5d41ec6cfab47e32164d5624269b1-Paper.pdf
 
 import numpy as np
 import torch

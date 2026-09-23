@@ -44,13 +44,13 @@ Given a text prompt, RoamScene3D first initializes the scene with a generated RG
 
 ## Videos
 
-GitHub does not render inline HTML video players in repository README pages. Please click the links below to open the uploaded demo videos directly.
+Click a video below to view or download it.
 
-| Demo | Link | Demo | Link | Demo | Link |
-|---|---|---|---|---|---|
-| Video 0 | [video0.mp4](assets/video0.mp4) | Video 1 | [video1.mp4](assets/video1.mp4) | Video 2 | [video2.mp4](assets/video2.mp4) |
-| Video 3 | [video3.mp4](assets/video3.mp4) | Video 4 | [video4.mp4](assets/video4.mp4) | Video 5 | [video5.mp4](assets/video5.mp4) |
-| Video 6 | [video6.mp4](assets/video6.mp4) | Video 7 | [video7.mp4](assets/video7.mp4) | Video 8 | [video8.mp4](assets/video8.mp4) |
+| Demo | Demo | Demo |
+|---|---|---|
+| [Video 0](assets/video0.mp4) | [Video 1](assets/video1.mp4) | [Video 2](assets/video2.mp4) |
+| [Video 3](assets/video3.mp4) | [Video 4](assets/video4.mp4) | [Video 5](assets/video5.mp4) |
+| [Video 6](assets/video6.mp4) | [Video 7](assets/video7.mp4) | [Video 8](assets/video8.mp4) |
 
 ## Getting Started
 

@@ -1,9 +1,12 @@
 import torch
 import torch.nn as nn
+import logging
 from peft import LoraConfig
 from packaging import version
 from diffusers import UNet2DConditionModel
 from diffusers.utils.import_utils import is_xformers_available
+
+logger = logging.getLogger(__name__)
 
 class PositionalEncoding(nn.Module):
     def __init__(self, input_dims, num_freqs, include_input=True):
@@ -39,6 +42,14 @@ class PositionalEncoding(nn.Module):
         return torch.cat(out, dim=-1)
 
 class UNetWithCam(nn.Module):
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
     def __init__(self, args):
         super().__init__()
 
@@ -49,14 +60,15 @@ class UNetWithCam(nn.Module):
         # print(self.unet)
         self.config = self.unet.config
         
-        self.pos_encoder = PositionalEncoding(input_dims=3, num_freqs=10)
+        # Condition on the full relative motion (translation + rotation).
+        self.pos_encoder = PositionalEncoding(input_dims=6, num_freqs=10)
         # self.cam_encoder = nn.Sequential(
         #     nn.Linear(self.pos_encoder.out_dim+3, args.cam_latent_dim),
         #     nn.ReLU(),
         #     nn.Linear(args.cam_latent_dim, self.unet.config.cross_attention_dim)
         # )
         self.cam_encoder = nn.Sequential(
-            nn.Linear(self.pos_encoder.out_dim+3, args.cam_latent_dim),
+            nn.Linear(self.pos_encoder.out_dim, args.cam_latent_dim),
             nn.LayerNorm(args.cam_latent_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
@@ -117,13 +129,19 @@ class UNetWithCam(nn.Module):
         cam_encoding_strategy="expand",  # "concat", "replace", "expand"
         **kwargs
     ):
+        if pose is None:
+            pose = getattr(self, 'motion_condition', None)
         if pose is not None:
+            pose = pose.to(device=sample.device, dtype=self.cam_encoder[0].weight.dtype)
+            batch_size = encoder_hidden_states.size(0)
+            if batch_size == 2 * pose.size(0):
+                # diffusers concatenates the unconditional then conditional batch.
+                pose = torch.cat((pose, pose), dim=0)
+            elif batch_size != pose.size(0):
+                raise ValueError('Motion batch must match the image batch (or CFG doubled batch)')
             # encoder_hidden_states = encoder_hidden_states[0].unsqueeze(0)
 
-            position = pose[:, :3]
-            pose_encoded = self.pos_encoder(position)
-            direction = pose[:, 3:]
-            pose_emb = self.cam_encoder(torch.cat([pose_encoded, direction], dim=-1)) # (batch, cross_dim)
+            pose_emb = self.cam_encoder(self.pos_encoder(pose)) # (batch, cross_dim)
             
             batch_size = encoder_hidden_states.size(0)
             seq_len = encoder_hidden_states.size(1)
@@ -142,7 +160,7 @@ class UNetWithCam(nn.Module):
                 
             elif cam_encoding_strategy == "expand":
                 # 方案2：扩展相机编码到整个序列
-                pose_emb = pose_emb.unsqueeze(1).repeat(2, 1, 1) # (batch, 1, cross_dim)
+                pose_emb = pose_emb.unsqueeze(1)
                 
                 if self.use_learnable_pose_token:
                     pose_token = self.pose_token.expand(batch_size, -1, -1)
@@ -155,7 +173,7 @@ class UNetWithCam(nn.Module):
                 
                 # 广播相机信息到所有位置
                 pose_expanded = pose_emb.expand(-1, seq_len, -1)
-                encoder_hidden_states = encoder_hidden_states + pose_expanded
+                encoder_hidden_states = encoder_hidden_states + pose_expanded.to(encoder_hidden_states.dtype)
                 
             else:
                 # 方案3：默认拼接方法（原始方法）
@@ -181,6 +199,14 @@ class UNetWithCam(nn.Module):
         )
 
 class UNetWOCam(nn.Module):
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
     def __init__(self, args):
         super().__init__()
 
@@ -195,13 +221,14 @@ class UNetWOCam(nn.Module):
             r=args.rank,
             lora_alpha=args.rank,
             init_lora_weights="gaussian",
-            target_modules=["attn1.to_k", "attn1.to_q", "attn1.to_v", "attn1.to_out.0"]#, "attn2.to_k", "attn2.to_q", "attn2.to_v", "attn2.to_out.0"],
+            target_modules=["attn1.to_k", "attn1.to_q", "attn1.to_v", "attn1.to_out.0",
+                            "attn2.to_k", "attn2.to_q", "attn2.to_v", "attn2.to_out.0"],
         )
         if args.enable_lora: 
             self.unet.add_adapter(unet_lora_config)
         else:
             for name, param in self.unet.named_parameters():
-                if "attn1" in name:
+                if "attn1" in name or "attn2" in name:
                     param.requires_grad_(True)
         if args.mixed_precision == "fp16":
             for param in self.unet.parameters():

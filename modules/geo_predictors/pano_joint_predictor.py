@@ -455,8 +455,8 @@ class PanoJointPredictor_super(GeoPredictor):
 class PanoJointPredictor(GeoPredictor):
     def __init__(self, save_path=None):
         super().__init__()
-        self.depth_predictor = OmnidataPredictor()
-        self.normal_predictor = OmnidataNormalPredictor()
+        from .metric3d_predictor import Metric3DJointPredictor
+        self.geometry_predictor = Metric3DJointPredictor()
         self.save_path = save_path
 
     def grads_to_normal(self, grads):
@@ -479,6 +479,7 @@ class PanoJointPredictor(GeoPredictor):
         normals = normals * is_inside + -normals * (1. - is_inside)
         return normals
 
+    @torch.enable_grad()
     def __call__(self, key, img, ref_distance, mask, gen_res=512, 
                  reg_loss_weight=1e-1, normal_loss_weight=1e-2, normal_tv_loss_weight=1e-2):
         
@@ -534,26 +535,25 @@ class PanoJointPredictor(GeoPredictor):
 
         # ===== 加速：改为批量推理（带微批分块避免 OOM） =====
         with torch.no_grad():
-            chunk = min(10, n_pers)  # 微批大小，可按显存调整
+            chunk = min(1, n_pers)  # 微批大小，可按显存调整
             pred_depth_chunks = []
             pred_normals_chunks = []
             for s in range(0, n_pers, chunk):
                 imgs_chunk = pers_imgs[s:s+chunk]  # [B, 3, 512, 512]
-                pd = self.depth_predictor.predict_depth(imgs_chunk).clip(0., None)  # [B, 1, 512, 512]
+                pd, pn = self.geometry_predictor.predict(imgs_chunk, fx[s:s+chunk])
                 pred_depth_chunks.append(pd)
-                pn = self.normal_predictor.predict_normal(imgs_chunk)  # [B, 3, 512, 512]
                 pred_normals_chunks.append(pn)
 
             pred_depth = torch.cat(pred_depth_chunks, dim=0)  # [n_pers, 1, 512, 512]
             pred_normals = torch.cat(pred_normals_chunks, dim=0)  # [n_pers, 3, 512, 512]
 
             # 每张归一化
-            pred_depth = pred_depth / (pred_depth.mean(dim=(2, 3), keepdim=True) + 1e-5)
+            self.geometry_predictor.model.cpu()
+            torch.cuda.empty_cache()
             # 畸变比例按批处理
             pred_distances_raw = pred_depth * pers_ratios.permute(0, 3, 1, 2)  # [n_pers, 1, 512, 512]
 
             # 法线归一化并批量旋转到世界系
-            pred_normals = pred_normals * 2. - 1.
             pred_normals = pred_normals / torch.linalg.norm(pred_normals, ord=2, dim=1, keepdim=True)
             pred_normals = pred_normals.permute(0, 2, 3, 1)
             pred_normals = torch.einsum('bij,bhwj->bhwi', rot_c2w, pred_normals)
@@ -568,41 +568,24 @@ class PanoJointPredictor(GeoPredictor):
         sup_infos = torch.cat([pers_dirs, pred_distances_raw, pred_normals_raw], dim=1)
 
         scale_params = torch.zeros([n_pers], requires_grad=True)
-        bias_params_global = torch.zeros([n_pers], requires_grad=True)
         bias_params_local_distance  = torch.zeros([n_pers, 1, gen_res, gen_res], requires_grad=True)
         bias_params_local_normal  = torch.zeros([n_pers, 3, 128, 128], requires_grad=True)
 
         # Optimize global parameters
         sp_dis_field = SphereDistanceField()
-        if key == 0:
-            all_iter_steps = 3500 
-        else:
-            all_iter_steps = 3500
-        lr_alpha = 1e-2
+        all_iter_steps = 2000
         init_lr = 1e-1
         init_lr_sp = 1e-2
         init_lr_local = 1e-1
         local_batch_size = 512
 
         optimizer_sp = torch.optim.Adam(sp_dis_field.parameters(), lr=init_lr_sp)
-        optimizer_global = torch.optim.Adam([scale_params, bias_params_global], lr=init_lr)
+        optimizer_global = torch.optim.Adam([scale_params], lr=init_lr)
         optimizer_local = torch.optim.Adam([bias_params_local_distance, bias_params_local_normal], lr=init_lr_local)
 
-        for phase in ['global', 'hybrid']:
+        for phase in ['hybrid']:
             for iter_step in range(all_iter_steps):
-                progress = iter_step / all_iter_steps
-                if phase == 'global':
-                    progress = progress * .5
-                else:
-                    progress = progress * .5 + .5
-
-                lr_ratio = (np.cos(progress * np.pi) + 1.) * (1. - lr_alpha) + lr_alpha
-                for g in optimizer_global.param_groups:
-                    g['lr'] = init_lr * lr_ratio
-                for g in optimizer_local.param_groups:
-                    g['lr'] = init_lr_local * lr_ratio
-                for g in optimizer_sp.param_groups:
-                    g['lr'] = init_lr_sp * lr_ratio
+                progress = (iter_step + 1) / all_iter_steps
 
                 # idx = np.random.randint(low=0, high=n_pers)
                 sample_coords = torch.rand(n_pers, local_batch_size, 1, 2) * 2. - 1
@@ -621,7 +604,6 @@ class PanoJointPredictor(GeoPredictor):
 
                 ref_normals = cur_sup_info[:, 4:, :, 0].permute(0, 2, 1)
                 ref_normals = ref_normals + normal_bias
-                ref_normals = ref_normals / torch.linalg.norm(ref_normals, 2, -1, True)
 
                 pred_distances, pred_grads = sp_dis_field(dirs.reshape(-1, 3), requires_grad=True)
                 pred_distances = pred_distances.reshape(n_pers, local_batch_size, 1)
@@ -644,7 +626,7 @@ class PanoJointPredictor(GeoPredictor):
                 errors = torch.cat([error_a, error_b], -1)
                 normal_loss = F.smooth_l1_loss(errors, torch.zeros_like(errors), beta=5e-1, reduction='mean')
 
-                reg_loss = ((F.softplus(scale_params).mean() - 1.)**2).mean()
+                reg_loss = ((F.softplus(scale_params) - 1.)**2).mean()
 
                 if phase == 'hybrid':
                     distance_bias_local = bias_params_local_distance
@@ -669,7 +651,7 @@ class PanoJointPredictor(GeoPredictor):
                 loss = ref_distance_loss * 20. * progress + \
                        distance_loss + reg_loss * reg_loss_weight +\
                        normal_loss * normal_loss_weight +\
-                       distance_bias_tv_loss * 1. +\
+                       distance_bias_tv_loss * normal_tv_loss_weight +\
                        normal_bias_tv_loss * normal_tv_loss_weight
             
                 optimizer_global.zero_grad()
@@ -685,8 +667,14 @@ class PanoJointPredictor(GeoPredictor):
 
         # Get new distance map and normal map
         pano_dirs = img_coord_to_pano_direction(img_coord_from_hw(height, width))
-        new_distances, new_grads = sp_dis_field(pano_dirs.reshape(-1, 3), requires_grad=True)
-        new_distances = new_distances.detach().reshape(height, width, 1)
-        new_normals = self.grads_to_normal(new_grads.detach().reshape(height, width, 3))
+        distance_chunks, grad_chunks = [], []
+        for chunk in pano_dirs.reshape(-1, 3).split(65536):
+            dis, grad = sp_dis_field(chunk, requires_grad=True)
+            distance_chunks.append(dis.detach())
+            grad_chunks.append(grad.detach())
+        new_distances = torch.cat(distance_chunks).reshape(height, width, 1)
+        new_normals = self.grads_to_normal(torch.cat(grad_chunks).reshape(height, width, 3))
+        known = (mask.permute(1, 2, 0) < .5) & torch.isfinite(ref_distance.permute(1, 2, 0)) & (ref_distance.permute(1, 2, 0) > 1e-5)
+        new_distances = torch.where(known, ref_distance.permute(1, 2, 0), new_distances)
 
         return new_distances, new_normals

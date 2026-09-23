@@ -1,5 +1,4 @@
 '''
-@paper: GAN Prior Embedded Network for Blind Face Restoration in the Wild (CVPR2021)
 @author: yangxy (yangtao9009@gmail.com)
 '''
 import os

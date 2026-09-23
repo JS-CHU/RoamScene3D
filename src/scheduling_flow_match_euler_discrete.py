@@ -56,7 +56,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             The number of diffusion steps to train the model.
         timestep_spacing (`str`, defaults to `"linspace"`):
             The way the timesteps should be scaled. Refer to Table 2 of the [Common Diffusion Noise Schedules and
-            Sample Steps are Flawed](https://huggingface.co/papers/2305.08891) for more information.
+            Sample Steps are Flawed](https://arxiv.org/abs/2305.08891) for more information.
         shift (`float`, defaults to 1.0):
             The shift value for the timestep schedule.
     """
@@ -393,7 +393,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         sigma_min = sigma_min if sigma_min is not None else in_sigmas[-1].item()
         sigma_max = sigma_max if sigma_max is not None else in_sigmas[0].item()
 
-        rho = 7.0  # 7.0 is the value used in the paper
+        rho = 7.0
         ramp = np.linspace(0, 1, num_inference_steps)
         min_inv_rho = sigma_min ** (1 / rho)
         max_inv_rho = sigma_max ** (1 / rho)

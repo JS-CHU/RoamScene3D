@@ -105,7 +105,7 @@ class PanoPersFusionInpainter(Inpainter):
 
         self.diff_inpainter = SDFTInpainter(model='withcam', SDFT_path='SDFT_weights/cam6_lora12_distill_fixloss', step=1000)
             
-        self.lama_inpainter = LamaInpainter()
+        self.lama_inpainter = None
         # self.lama_inpainter = None
         
         self.save_path = save_path
@@ -139,7 +139,7 @@ class PanoPersFusionInpainter(Inpainter):
             pers_mask = pers_masks[i]
             pers_mask = (pers_mask > 0.5).float() #CHW
             if self.lama_inpainter is not None:
-                kernel = torch.from_numpy(cv.getStructuringElement(cv.MORPH_ELLIPSE, (11, 11))).float().to(pers_mask.device)
+                kernel = torch.from_numpy(cv.getStructuringElement(cv.MORPH_ELLIPSE, (9, 9))).float().to(pers_mask.device)
                 smooth_mask = pers_mask
                 smooth_mask = erosion(pers_mask[None], kernel=kernel)[0]
                 smooth_mask = dilation(smooth_mask[None], kernel=kernel)[0]
@@ -199,9 +199,11 @@ class PanoPersFusionInpainter(Inpainter):
         pers_images_b = torch.stack(pers_images, dim=0)  # [6, 3, 512, 512]
         # 阈值化并保持单通道掩膜
         pers_masks_b = torch.stack([(m > 0.5).float() for m in pers_masks], dim=0)  # [6, 1, 512, 512]
+        kernel = torch.from_numpy(cv.getStructuringElement(cv.MORPH_ELLIPSE, (9, 9))).to(pers_masks_b)
+        pers_masks_b = erosion(dilation(pers_masks_b, kernel=kernel), kernel=kernel)
 
         if self.lama_inpainter is not None:
-            kernel = torch.from_numpy(cv.getStructuringElement(cv.MORPH_ELLIPSE, (11, 11))).float().to(pers_masks_b.device)
+            kernel = torch.from_numpy(cv.getStructuringElement(cv.MORPH_ELLIPSE, (9, 9))).float().to(pers_masks_b.device)
             # 批量形态学滤波
             smooth_masks_b = erosion(pers_masks_b, kernel=kernel)
             smooth_masks_b = dilation(smooth_masks_b, kernel=kernel)

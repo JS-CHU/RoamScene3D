@@ -38,7 +38,8 @@ from scene import Scene, GaussianModel
 from gaussian_renderer import render
 from utils.graphics import focal2fov
 from utils.loss import l1_loss, ssim
-from utils.gen_pano import generate_pano
+from utils.scene_geometry import plan_trajectory, relative_motion, support_pose, evaluation_poses
+from utils.semantic_grounding import validate_graph, guidance_text
 # from SceneGraph import SceneGraph
 from pano_semantic_segment import PanoSemanticSegmentor
 from modules.pose_sampler.circle_pose_sampler import CirclePoseSampler
@@ -49,12 +50,17 @@ from scene.dataset_readers import loadCamerasFromData
 from utils.projection import *
 
         
-@torch.no_grad()
 class GenerationPipeline(torch.nn.Module):
-    def __init__(self, scene_name, attempt_idx=""):
+    def __init__(self, scene_name, attempt_idx="", seed=42):
         '''initialize models and define shared variables'''
 
         super().__init__()
+
+        self.seed = seed
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
         # renderer setting
         self.blur_radius = 0
@@ -76,6 +82,10 @@ class GenerationPipeline(torch.nn.Module):
         self.faces = torch.empty((3, 0), device=self.device, dtype=torch.long, requires_grad=False)# gaussian_train_data
         self.pix_to_face = None
         self.object_aware = False
+        self.anchor_ids = []
+        self.bindings = {}
+        self.verified_relations = []
+        self.trajectory_focus = {}
 
         self.pose_scale = 0.6
         self.pano_center_offset = (-0.2,0.3)
@@ -112,28 +122,9 @@ class GenerationPipeline(torch.nn.Module):
         os.makedirs(self.GS_render_dir, exist_ok=True)
 
     def set_sampler(self):
-        self.global_pose_sampler_conf_list = [{
-                'traverse_ratios': [0.1],
-                'n_anchors_per_ratio': [4]
-            },
-            {
-                'traverse_ratios': [0.2],
-                'n_anchors_per_ratio': [4]
-            },
-            {
-                'traverse_ratios': [0.3],
-                'n_anchors_per_ratio': [4]
-            },
-        ]
-        self.perturbation_pose_sampler_conf = {
-            'traverse_ratios': [0.2],
-            'n_anchors_per_ratio': [4]
-        }
-        self.max_pose_sampler_conf = {
-            'traverse_ratios': [0.6],
-            'n_anchors_per_ratio': [200]
-        }
-    
+        self.n_roaming_views = 24
+        self.base_trajectory_gamma = 0.4
+
     def load_modules(self):
         '''在__init__函数中调用 加载两个模型inpainter, geo_predictor'''
         self.inpainter = PanoPersFusionInpainter(save_path=self.save_path)
@@ -271,90 +262,55 @@ class GenerationPipeline(torch.nn.Module):
         '''
         self.rgbd_to_mesh(pano_rgbl, pano_distance, mask=depth_edge_inpaint_mask, using_distance_map=True, world_to_cam=pose, pseudo=pseudo)
 
-    def stage_inpaint_pano_greedy_search(self, pose_dict, source_depth, add_mesh=False):
-        '''
-        选取完整度处于2/3分位的pose进行inpainting 完成mesh_iteration并且收集pseudo_view
-        using render_pano(), inpaint_new_panorama(), geo_check(), pano_distance_to_mesh()
-        INPUT:pose_dict OUTPUT:inpainted_panos_and_poses(list)
-        '''
-
+    @torch.no_grad()
+    def stage_inpaint_pano_greedy_search(self, pose_dict, source_depth, add_mesh=True):
+        """Traverse the closed path in order, filter and fuse every new observation."""
         inpainted_panos_and_poses = []
-        while len(pose_dict) > 0:
-            print(f"len(pose_dict):{len(pose_dict)}")
-            keys = list(pose_dict.keys())
-            key = random.choice(keys)
-            pose = pose_dict[key]
-            # print(f"random_selected_key:{key}")
-            del pose_dict[key]
-            
-            # rendering rgb depth mask
-            cam = pose[:3, 3].to('cuda')
-            cam = self.cam_scale(source_depth, cam)
-            pose = pose.cuda()
+        source_pose = torch.eye(4, device=self.device)
+        for key, pose in pose_dict.items():
+            pose = pose.to(self.device)
+            motion = self.cam_scale(source_depth, pose, source_pose)
             pano_rgb, pano_distance, pano_mask = self.render_pano(pose)
-
-            # inpaint pano
-            colors = pano_rgb.permute(1,2,0).clone() # HWC
-            distances = pano_distance.unsqueeze(-1).clone()
-            pano_inpaint_mask = pano_mask.clone()
-
-            if pano_inpaint_mask.min().item() < .5:
-                # inpainting pano
-                colors, distances, normals = self.inpaint_new_panorama(idx=1, colors=colors, distances=distances, pano_mask=pano_inpaint_mask, pose=cam) # HWC, HWC, HW
-                
-                #apply_GeoCheck:
-                perf_pose = pose.clone()
-                perf_pose[0,3], perf_pose[1,3], perf_pose[2,3] = -pose[0,3], pose[2,3], 0 
+            colors = pano_rgb.permute(1, 2, 0).clone()
+            distances = pano_distance.clone()
+            missing = pano_mask > .5
+            perf_pose = torch.as_tensor(support_pose(pose.cpu().numpy()), device=pose.device, dtype=pose.dtype)
+            if missing.any():
+                focus = self.trajectory_focus.get(key)
+                prompt = guidance_text(self.scene_graph, focus, self.bindings, self.verified_relations)
+                colors, distances, normals = self.inpaint_new_panorama(
+                    idx=key+1, colors=colors, distances=distances[..., None],
+                    pano_mask=missing.float(), pose=motion, prompt=prompt)
                 rays = gen_pano_rays(perf_pose, self.pano_height, self.pano_width)
-                conflict_mask = self.sup_pool.geo_check(rays, distances.unsqueeze(-1))    # 0 conflict, 1 not conflict
-                pano_inpaint_mask = pano_inpaint_mask * conflict_mask # 没有冲突的地方被标记为需要修复的地方，有冲突的地方略过
-                    
-            # add new mesh
-            if add_mesh:
-                self.pano_distance_to_mesh(colors.permute(2,0,1), distances, pano_inpaint_mask, pose=pose) #CHW, HW, HW
-
-            # apply_GeoCheck:
-            sup_mask = pano_inpaint_mask.clone()
-            self.sup_pool.register_sup_info(pose=perf_pose, mask=sup_mask, rgb=colors, distance=distances.unsqueeze(-1), normal=normals)
-            
-            # save renderred
+                keep = missing & (self.sup_pool.geo_check(rays, distances[..., None]) > .5)
+                keep &= torch.isfinite(distances) & (distances > 1e-5)
+                if keep.any():
+                    if add_mesh:
+                        self.pano_distance_to_mesh(colors.permute(2, 0, 1), distances, keep, pose=pose)
+                    self.sup_pool.register_sup_info(pose=perf_pose, mask=keep, rgb=colors,
+                                                    distance=distances[..., None], normal=normals)
             self.namer += 1
-            panorama_tensor_pil = functions.tensor_to_pil(pano_rgb.unsqueeze(0))
-            panorama_tensor_pil.save(f"{self.save_path}/renderred_pano_{self.namer}.png")
+            functions.tensor_to_pil(pano_rgb[None]).save(f"{self.save_path}/renderred_pano_{self.namer}.png")
             if self.save_details:
-                inpaint_mask_pil = Image.fromarray(pano_mask.detach().cpu().squeeze().float().numpy() * 255).convert("RGB")
-                inpaint_mask_pil.save(f"{self.save_path}/mask_{self.namer}.png")  
-
-            # save inpainted
-            panorama_tensor_pil = functions.tensor_to_pil(colors.permute(2,0,1).unsqueeze(0))
-            panorama_tensor_pil.save(f"{self.save_path}/inpainted_pano_{self.namer}.png")
-
-            # save pose
-            torch.save(pose, f"{self.save_path}/pose_{self.namer}.pt") 
-            
+                Image.fromarray((missing.cpu().numpy()*255).astype(np.uint8)).save(f"{self.save_path}/mask_{self.namer}.png")
+            functions.tensor_to_pil(colors.permute(2, 0, 1)[None]).save(f"{self.save_path}/inpainted_pano_{self.namer}.png")
+            torch.save(pose.cpu(), f"{self.save_path}/pose_{self.namer}.pt")
+            inpainted_panos_and_poses.append((colors.permute(2, 0, 1)[None].cpu(), pose.cpu()))
+            source_pose = pose
         return inpainted_panos_and_poses
 
-    def cam_scale(self, source_depth, cam):
-        top_rows = source_depth[0:5, :]
-        bottom_rows = source_depth[-5:, :]
-        valid_top_depths = top_rows[top_rows > 0]
-        valid_bottom_depths = bottom_rows[bottom_rows > 0]
-        dist_to_ceiling = torch.median(valid_top_depths)
-        dist_to_floor = torch.median(valid_bottom_depths)
-        scene_scale = dist_to_ceiling + dist_to_floor
-        normalized_pos = cam / scene_scale
-        directions = torch.tensor([[[1, 0, 0],
-                               [0, 0, 1],
-                               [-1, 0, 0],
-                               [0, 0, -1],
-                               [0, 1, 0],
-                               [0, -1, 0]]],
-                               dtype=torch.float32).to(cam.device)
-        cam = torch.cat([normalized_pos.unsqueeze(0).unsqueeze(0).repeat(1, directions.size(1), 1), directions], dim=-1)
-        cam = cam.view(-1, 6)
-        return cam
+    def cam_scale(self, source_depth, target_pose, source_pose):
+        # Express the same physical transition in each source cubemap camera's
+        # coordinates: forward motion for one face is lateral for another.
+        source = source_pose.cpu().numpy()
+        target = target_pose.cpu().numpy()
+        distance = source_depth.cpu().numpy()
+        motion = np.stack([relative_motion(face.cpu().numpy() @ source,
+                                           face.cpu().numpy() @ target, distance)
+                           for face in self.cubemap_w2c_list])
+        return torch.as_tensor(motion, device=target_pose.device, dtype=torch.float32)
 
-    def inpaint_new_panorama(self, idx, colors, distances, pano_mask, pose):
+    def inpaint_new_panorama(self, idx, colors, distances, pano_mask, pose, prompt=""):
         '''
         inpainting
         using cv2.getStructuringElement(), inpainter.inpaint(), geo_predictor()
@@ -379,7 +335,7 @@ class GenerationPipeline(torch.nn.Module):
 
         inpainted_distances = None
         inpainted_normals = None
-        inpainted_img = self.inpainter.inpaint(idx, colors, mask, pose)
+        inpainted_img = self.inpainter.inpaint(idx, colors, mask, pose, label=prompt)
 
         # Keep renderred part
         inpainted_img = colors * (1 - mask) + inpainted_img * mask# 仅改变掩码部分
@@ -389,9 +345,9 @@ class GenerationPipeline(torch.nn.Module):
                                                                     inpainted_img,
                                                                     distances,
                                                                     mask=mask,
-                                                                    reg_loss_weight=0.,
-                                                                    normal_loss_weight=5e-2,
-                                                                    normal_tv_loss_weight=5e-2)
+                                                                    reg_loss_weight=0.1,
+                                                                    normal_loss_weight=0.01,
+                                                                    normal_tv_loss_weight=0.01)
         '''深度估计+法线预测'''
         inpainted_distances = inpainted_distances.squeeze()
         return inpainted_img, inpainted_distances, inpainted_normals
@@ -404,10 +360,7 @@ class GenerationPipeline(torch.nn.Module):
         '''
 
         image_path = f"{self.input_dir}/scene_panoramas/{self.scene_name}.png"
-        image = Image.open(image_path)
-        if image.size[0] < image.size[1]: # size[0]表示图像的宽，size[1]表示图像的高
-            image = image.transpose(Image.TRANSPOSE)
-        image = functions.resize_image_with_aspect_ratio(image, new_width=self.pano_width)
+        image = Image.open(image_path).convert('RGB').resize((self.pano_width, self.pano_height))
         panorama_tensor = torch.tensor(np.array(image))[...,:3].permute(2,0,1).float()/255
 
         depth = self.predict_depth(panorama_tensor)
@@ -415,11 +368,10 @@ class GenerationPipeline(torch.nn.Module):
         return panorama_tensor, depth
     
     def predict_depth(self, panorama_tensor):
-        depth_scale_factor = 3.4092
-        pano_fusion_distance_predictor = PanoFusionDistancePredictor()
-        depth = pano_fusion_distance_predictor.predict(panorama_tensor.permute(1,2,0))# input:HW3
-        depth = depth/depth.max() * depth_scale_factor # 1.8
-        return depth
+        image = panorama_tensor.permute(1, 2, 0).to(self.device)
+        depth, self.initial_normals = self.geo_predictor(
+            0, image, torch.ones_like(image[..., :1]), torch.ones_like(image[..., :1]))
+        return depth.squeeze(-1)
 
     def load_camera_poses(self, pano_center_offset=[0,0]):# panorama_camera中心偏移量默认为0
         '''
@@ -514,6 +466,7 @@ class GenerationPipeline(torch.nn.Module):
                 cubemaps_depth += [view_depth.cpu().clone()]
         return cubemaps, cubemaps_depth# BCHW, BCHW
 
+    @torch.enable_grad()
     def train_GS(self):
         if not self.scene:
             raise('Build 3D Scene First!')
@@ -556,9 +509,8 @@ class GenerationPipeline(torch.nn.Module):
                         self.gaussians.reset_opacity()
 
                 # Optimizer step
-                if iteration < self.opt.iterations:
-                    self.gaussians.optimizer.step()
-                    self.gaussians.optimizer.zero_grad(set_to_none = True)
+                self.gaussians.optimizer.step()
+                self.gaussians.optimizer.zero_grad(set_to_none=True)
     def GS2pano(self, viewpoint_cam, gaussians, opt, background, i=0):
         """
         参考 eval_GS 的相机创建流程：
@@ -693,31 +645,36 @@ class GenerationPipeline(torch.nn.Module):
             pano_pil.save(save_path)
             print(f"Saved {save_path}")
 
-    def eval_GS(self, eval_GS_cams):
-        viewpoint_stack = eval_GS_cams
-        # l1_val = 0
-        # ssim_val = 0
-        # psnr_val = 0
-        framelist = []
-        depthlist = []
-        for i in range(len(viewpoint_stack)):
-            viewpoint_cam, mesh_pose = viewpoint_stack[i]
-            self.GS2pano(viewpoint_cam, self.gaussians, self.opt, self.background, i=i)
-            results = render(viewpoint_cam, self.gaussians, self.opt, self.background) # 用这个方法来得到3DGS的渲染结果
-            frame, depth = results['render'], results['depth'].detach().cpu()
-            framelist.append(
-                np.round(frame.squeeze(0).permute(1,2,0).detach().cpu().numpy().clip(0,1)*255.).astype(np.uint8))
-            depthlist.append(colorize_single_channel_image(depth.detach().cpu()/self.scene_depth_max))
+    @torch.no_grad()
+    def eval_GS(self, cameras, mode='geometry'):
+        outdir = os.path.join(self.GS_render_dir, mode)
+        os.makedirs(outdir, exist_ok=True)
+        frames = []
+        for i, (camera, _) in enumerate(cameras):
+            result = render(camera, self.gaussians, self.opt, self.background)
+            rgb = (result['render'].detach().cpu().permute(1, 2, 0).numpy().clip(0, 1)*255).round().astype(np.uint8)
+            Image.fromarray(rgb).save(os.path.join(outdir, f'{i:03d}.png'))
+            if mode == 'geometry':
+                # Preserve quantitative depth; a colormap is not an RGBD sequence.
+                np.save(os.path.join(outdir, f'{i:03d}_depth.npy'), result['depth'].detach().cpu().numpy().squeeze())
+                frames.append(rgb)
+        if frames:
+            write_video(os.path.join(outdir, 'rgb.mp4'), frames, fps=30)
 
-        if self.save_details:
-            for i, frame in enumerate(framelist):
-                image = Image.fromarray(frame, mode="RGB")
-                image.save(os.path.join(self.GS_render_dir, f"pers_render_{i}.png"))
-                functions.write_image(f"{self.GS_render_dir}/pers_render_depth_{i}.png", depthlist[i])
-        
-        write_video(f"{self.GS_render_dir}/GS_render_video.mp4", framelist[6:], fps=30)
-        write_video(f"{self.GS_render_dir}/GS_depth_video.mp4", depthlist[6:], fps=30)
-        print("Result saved at: ", self.GS_render_dir)
+    def evaluate_views(self):
+        from scene.cameras import Camera
+        distance = np.load(os.path.join(self.save_path, 'initial_distance.npy'))
+        for mode in ('appearance', 'geometry'):
+            poses = evaluation_poses(distance, mode, seed=self.seed)
+            np.save(os.path.join(self.GS_render_dir, f'{mode}_poses.npy'), poses)
+            cameras = []
+            for i, pose in enumerate(poses):
+                cv_pose = np.diag([-1., -1., 1., 1.]) @ pose
+                camera = Camera(colmap_id=i, R=cv_pose[:3, :3].T, T=cv_pose[:3, 3],
+                                FoVx=np.pi/2, FoVy=np.pi/2, image=torch.zeros(3, 512, 512),
+                                gt_alpha_mask=None, image_name=str(i), uid=i, data_device=self.device)
+                cameras.append((camera, pose))
+            self.eval_GS(cameras, mode)
 
     def xyz_to_xz_y(self, xyz_coords):
         x = xyz_coords[..., 0]
@@ -942,112 +899,56 @@ class GenerationPipeline(torch.nn.Module):
         print(f"PLY saved to: {mesh_path}")
 
     def load_vertices_and_colors(self, filename=None):
-        """
-        从 PLY 文件加载 vertices 和 colors 数据
-        
-        Args:
-            filename (str, optional): PLY 文件路径。如果为 None，则使用默认路径
-        """
-        if filename is None:
-            filename = os.path.join(self.save_path, "initial_scene.ply")
-        
-        if not os.path.exists(filename):
-            print(f"错误: PLY 文件不存在: {filename}")
-            return
-        
-        vertices_list = []
-        colors_list = []
-        
-        try:
-            with open(filename, 'r') as f:
-                lines = f.readlines()
-                
-                # 解析 PLY 文件头
-                header_end = 0
-                num_vertices = 0
-                for i, line in enumerate(lines):
-                    line = line.strip()
-                    if line.startswith("element vertex"):
-                        num_vertices = int(line.split()[-1])
-                    elif line == "end_header":
-                        header_end = i + 1
-                        break
-                
-                if num_vertices == 0:
-                    print("警告: PLY 文件中没有顶点数据")
-                    return
-                
-                # 读取顶点数据
-                for i in range(header_end, header_end + num_vertices):
-                    if i >= len(lines):
-                        break
-                    
-                    parts = lines[i].strip().split()
-                    if len(parts) >= 6:
-                        # 解析位置 (x, y, z)
-                        x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-                        vertices_list.append([x, y, z])
-                        
-                        # 解析颜色 (r, g, b)
-                        r, g, b = float(parts[3]), float(parts[4]), float(parts[5])
-                        # 将颜色从 [0, 255] 转换为 [0, 1]
-                        colors_list.append([r, g, b])
-                
-                if len(vertices_list) == 0:
-                    print("警告: 没有成功解析到顶点数据")
-                    return
-                
-                # 转换为 PyTorch 张量
-                vertices_np = np.array(vertices_list, dtype=np.float32)  # (N, 3)
-                colors_np = np.array(colors_list, dtype=np.float32)      # (N, 3)
-                
-                # 转换为 (3, N) 格式并移动到设备
-                self.vertices = torch.from_numpy(vertices_np.T).to(self.device)  # (3, N)
-                self.colors = torch.from_numpy(colors_np.T).to(self.device)      # (3, N)
-                
-                print(f"PLY 文件加载成功: {filename}")
-                print(f"加载的顶点数量: {self.vertices.shape[1]}")
-                
-        except Exception as e:
-            print(f"加载 PLY 文件时出错: {e}")
-            # 如果加载失败，重置为空张量
-            self.vertices = torch.empty((3, 0), device=self.device, requires_grad=False)
-            self.colors = torch.empty((3, 0), device=self.device, requires_grad=False)
-    
+        from plyfile import PlyData
+        filename = filename or os.path.join(self.save_path, 'fused_scene.ply')
+        vertices = PlyData.read(filename)['vertex']
+        xyz = np.column_stack([vertices[k] for k in ('x', 'y', 'z')]).astype(np.float32)
+        rgb = np.column_stack([vertices[k] for k in ('red', 'green', 'blue')]).astype(np.float32)/255.
+        if not len(xyz) or not np.isfinite(xyz).all():
+            raise ValueError('Fused mesh must contain finite vertices')
+        self.vertices = torch.from_numpy(xyz.T.copy()).to(self.device)
+        self.colors = torch.from_numpy(rgb.T.copy()).to(self.device)
+
     def load_inpainted_panos_and_poses(self):
         inpainted_panos_and_poses = []
-        sr_dir = os.path.join(self.save_path, 'tmp')
-        for item in os.listdir(sr_dir):
-            if item.startswith('sr_'):
+        sr_dir = self.save_path
+        for item in sorted(os.listdir(sr_dir), key=lambda name: int(name.rsplit('_', 1)[-1].split('.')[0]) if name.startswith('sr_2_inpainted_pano_') else -1):
+            if item.startswith('sr_2_inpainted_pano_'):
                 num = item.split('_')[-1].split('.')[0]
                 # print(num)
                 inpainted_pano = Image.open(f"{sr_dir}/{item}")
                 inpainted_pano = functions.pil_to_tensor(inpainted_pano)
                 # print(f"{self.save_path}/pose_{num}.pt")
-                pose = torch.load(f"{self.save_path}/pose_{num}.pt")
+                pose = torch.load(f"{self.save_path}/pose_{num}.pt", map_location=self.device).float()
                 inpainted_panos_and_poses += [(inpainted_pano, pose)]
+        if len(inpainted_panos_and_poses) != 24:
+            raise ValueError(f"Expected 24 PASD panoramas, got {len(inpainted_panos_and_poses)}; rerun roaming and SR")
         return inpainted_panos_and_poses
 
     def load_scene_graph(self, filepath):
-        if os.path.exists(filepath):
-            with open(filepath, "r") as file:
-                scene_graph_json = file.read()
-                self.scene_graph: dict = json.loads(scene_graph_json)
+        with open(filepath) as file:
+            self.scene_graph = validate_graph(json.load(file))
 
-    def pano_segment(self):
+    def pano_segment(self, depth, panorama):
         self.load_scene_graph(f"{self.input_dir}/scene_graphs/{self.scene_name}.json")
-        pano_path = f"{self.input_dir}/scene_panoramas/{self.scene_name}.png"
-        segmentor = PanoSemanticSegmentor(pano_path, self.scene_graph)
-        seg_map, intance_num = segmentor.segment(f"{self.save_path}/instances")
-        self.instance_num = intance_num
-        self.object_aware = True
+        segmentor = PanoSemanticSegmentor(f"{self.input_dir}/scene_panoramas/{self.scene_name}.png", self.scene_graph)
+        image = (panorama.permute(1, 2, 0).cpu().numpy()*255).clip(0, 255).astype(np.uint8)
+        seg_map, self.instance_num = segmentor.segment(f"{self.save_path}/instances", depth.cpu().numpy(), image)
+        self.anchor_ids = segmentor.anchor_ids
+        self.bindings = segmentor.bindings
+        self.verified_relations = segmentor.verified_relations
         self.labels = torch.from_numpy(seg_map).flatten()
-        
+        centers, boxes = [], []
+        from itertools import product
+        for geometry in getattr(segmentor, 'anchor_geometries', []):
+            centers.append(geometry['center'])
+            boxes.append(list(product(*zip(geometry['min'], geometry['max']))))
+        self.instance_centers = torch.as_tensor(np.asarray(centers).reshape(-1, 3), device=self.device, dtype=torch.float32)
+        self.instance_bbx8 = torch.as_tensor(np.asarray(boxes).reshape(-1, 8, 3), device=self.device, dtype=torch.float32)
+        np.save(f"{self.save_path}/instances/seg_map.npy", seg_map)
+        self.object_aware = bool(self.anchor_ids)
         del segmentor
         torch.cuda.empty_cache()
-
-        np.save(f"{self.save_path}/instances/seg_map.npy", seg_map)
-        np.save(f"{self.save_path}/instances/labels.npy", self.labels.detach().cpu().numpy())
 
     def decouple_instances(self):
         device = self.pc.device
@@ -1107,120 +1008,24 @@ class GenerationPipeline(torch.nn.Module):
 
         return centers, bbx_all
 
-    def traj_gen(self, positions, sampler, max_traj):
-        perturbation_pose_dict = {}
-        key = 0
-        if (
-            self.instance_num == 0
-            or self.labels is None
-            or torch.all(self.labels == 0)
-            or self.instance_centers is None
-            or torch.all(self.instance_centers == 0)
-            or self.instance_bbx8 is None
-            or self.instance_bbx8.numel() == 0
-        ):
-            for pos in positions:
-                perturbation_pose_dict[key] = sampler.sample_pose(pos)
-                key += 1
-            return perturbation_pose_dict
+    def traj_gen(self, distance):
+        points, focus, knots = plan_trajectory(
+            distance.cpu().numpy(), self.instance_centers.cpu().numpy(), self.instance_bbx8.cpu().numpy(),
+            n_views=self.n_roaming_views, gamma=self.base_trajectory_gamma)
+        poses = {}
+        for i, (point, anchor) in enumerate(zip(points, focus)):
+            pose = torch.eye(4, device=self.device)
+            # The renderer accepts world-to-camera transforms, not camera centers.
+            pose[:3, 3] = -torch.as_tensor(point, device=self.device, dtype=pose.dtype)
+            poses[i] = pose
+            self.trajectory_focus[i] = None if anchor is None else self.anchor_ids[anchor]
+        np.savetxt(os.path.join(self.save_path, 'traj.txt'), points)
+        np.savetxt(os.path.join(self.save_path, 'trajectory_knots.txt'), knots)
+        with open(os.path.join(self.save_path, 'trajectory_focus.json'), 'w') as f:
+            json.dump(self.trajectory_focus, f, indent=2)
+        return poses
 
-        two_pi = 2.0 * math.pi
-        pi = math.pi
-
-        def _angle_wrap(a: torch.Tensor) -> torch.Tensor:
-            return torch.remainder(a + pi, two_pi) - pi
-
-        max_traj_x = max_traj[:, 0]
-        max_traj_z = max_traj[:, 2]
-        max_traj_phi = torch.atan2(max_traj_z, max_traj_x)
-        max_traj_phi = torch.remainder(max_traj_phi + two_pi, two_pi)
-        max_traj_r = torch.sqrt(max_traj_x * max_traj_x + max_traj_z * max_traj_z)
-
-        sort_idx = torch.argsort(max_traj_phi)
-        max_traj_phi = max_traj_phi[sort_idx]
-        max_traj_r = max_traj_r[sort_idx]
-        max_traj_phi = torch.cat([max_traj_phi, max_traj_phi[:1] + two_pi], dim=0)
-        max_traj_r = torch.cat([max_traj_r, max_traj_r[:1]], dim=0)
-
-        up = torch.tensor([0.0, 1.0, 0.0], device=max_traj.device, dtype=max_traj.dtype)
-
-        def _interp_max_r(phi_query: torch.Tensor) -> torch.Tensor:
-            phi_query = torch.remainder(phi_query + two_pi, two_pi)
-            idx = torch.searchsorted(max_traj_phi, phi_query).clamp(1, max_traj_phi.numel() - 1)
-            idx0 = idx - 1
-            a0 = max_traj_phi[idx0]
-            a1 = max_traj_phi[idx]
-            r0 = max_traj_r[idx0]
-            r1 = max_traj_r[idx]
-            denom = (a1 - a0).clamp_min(1e-8)
-            t = (phi_query - a0) / denom
-            return r0 * (1.0 - t) + r1 * t
-
-        traj_points = []
-        for pos in positions:
-            dx = self.instance_centers[:, 0] - pos[0]
-            dz = self.instance_centers[:, 2] - pos[2]
-            distances = torch.sqrt(dx * dx + dz * dz + 1e-8)
-            min_idx = torch.argmin(distances)
-
-            center = self.instance_centers[min_idx]
-            bbx = self.instance_bbx8[min_idx]
-            bbx_min = bbx.min(dim=0).values
-            bbx_max = bbx.max(dim=0).values
-
-            w_x = torch.abs(bbx_max[0] - bbx_min[0])
-            w_z = torch.abs(bbx_max[2] - bbx_min[2])
-            s_obj = torch.sqrt(w_x * w_x + w_z * w_z + 1e-8)
-            sigma_phi = torch.clamp(0.6 * s_obj, min=0.2, max=1.2)
-            amplitude = torch.clamp(0.25 * s_obj, min=0.05, max=0.6)
-
-            phi_l = torch.atan2(pos[2], pos[0])
-            phi_o = torch.atan2(center[2], center[0])
-            dphi = _angle_wrap(phi_l - phi_o)
-            weight = dphi * torch.exp(-(dphi * dphi) / (2.0 * sigma_phi * sigma_phi + 1e-8))
-
-            view_vec = torch.stack([center[0] - pos[0], torch.zeros_like(pos[1]), center[2] - pos[2]], dim=0)
-            tangent = torch.cross(view_vec, up)
-            tangent_norm = torch.linalg.norm(tangent) + 1e-8
-            tangent = tangent / tangent_norm
-
-            offset = -amplitude * weight * tangent
-            p_new = pos + offset
-            p_new = torch.stack([p_new[0], pos[1], p_new[2]], dim=0)
-
-            phi_new = torch.atan2(p_new[2], p_new[0])
-            r_new = torch.sqrt(p_new[0] * p_new[0] + p_new[2] * p_new[2] + 1e-8)
-            r_max = _interp_max_r(phi_new)
-            if r_new > r_max:
-                p_new = torch.stack(
-                    [torch.cos(phi_new) * r_max, pos[1], torch.sin(phi_new) * r_max],
-                    dim=0,
-                )
-
-            traj_points.append(p_new)
-            perturbation_pose_dict[key] = sampler.sample_pose(p_new)
-            key += 1
-
-        os.makedirs(self.save_path, exist_ok=True)
-        traj_path = os.path.join(self.save_path, "traj.txt")
-        if len(traj_points) > 0:
-            traj_arr = torch.stack(traj_points, dim=0).detach().cpu().numpy()
-            np.savetxt(traj_path, traj_arr, fmt="%.6f")
-        return perturbation_pose_dict
-
-    def scene_inpainting(self, init_depth, pose_conf):
-        # Global Inpainting
-        print(f"Global Inpainting...")
-        globale_sampler = CirclePoseSampler(init_depth, **pose_conf)
-        global_cameras = globale_sampler.anchor_pts # [N, 3]
-        global_cameras = self.xyz_to_xz_y(global_cameras)
-        global_pose_dict = {}
-        key = 0
-        for pos in global_cameras:
-            global_pose_dict[key] = globale_sampler.sample_pose(pos)
-            key += 1
-        inpainted_panos_and_poses = self.stage_inpaint_pano_greedy_search(global_pose_dict, init_depth)
-
+    @torch.no_grad()
     def roaming(self):
         self.load_modules()
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
@@ -1238,37 +1043,29 @@ class GenerationPipeline(torch.nn.Module):
         self.sup_pool.register_sup_info(pose=torch.eye(4).cuda(),
                                         mask=torch.ones([self.pano_height, self.pano_width]),
                                         rgb=panorama_tensor.permute(1,2,0),
-                                        distance=init_depth.unsqueeze(-1))
-        self.sup_pool.gen_occ_grid(256)
+                                        distance=init_depth.unsqueeze(-1), normal=self.initial_normals)
 
         # print(f"Instance-aware Scene Modeling...")
         # segment
-        self.pano_segment()
+        self.pano_segment(init_depth, panorama_tensor)
 
         # Pano2Mesh
         self.pano_distance_to_mesh(panorama_tensor, init_depth, depth_edge_inpaint_mask)
 
-        self.instance_centers, self.instance_bbx8 = self.decouple_instances()
         # 保存 instance_bbx8 到 instances 目录下的 bbx.txt
         if self.instance_bbx8 is not None and self.instance_bbx8.numel() > 0:
             bbx_path = os.path.join(self.save_path, "instances", "bbx.txt")
             np.savetxt(bbx_path, self.instance_bbx8.cpu().numpy().reshape(-1, 3), fmt="%.6f")
             print(f"已保存 instance_bbx8 到 {bbx_path}")
 
-        # Global Inpainting
-        for i in range(len(self.global_pose_sampler_conf_list)): 
-            self.scene_inpainting(pano_depth, self.global_pose_sampler_conf_list[i])
-
-        # Object-aware Inpainting
-        print(f"Object-aware Inpainting...")
-        perturbation_sampler = CirclePoseSampler(pano_depth, **self.perturbation_pose_sampler_conf)
-        perturbation_cameras = perturbation_sampler.anchor_pts # [N, 3]
-        perturbation_cameras = self.xyz_to_xz_y(perturbation_cameras)
-        max_sampler = CirclePoseSampler(pano_depth, **self.max_pose_sampler_conf)
-        max_cameras = max_sampler.anchor_pts # [N, 3]
-        max_cameras = self.xyz_to_xz_y(max_cameras)
-        perturbation_pose_dict = self.traj_gen(perturbation_cameras, perturbation_sampler, max_cameras)
-        inpainted_panos_and_poses = self.stage_inpaint_pano_greedy_search(perturbation_pose_dict, init_depth)
+        pose_dict = self.traj_gen(init_depth)
+        self.stage_inpaint_pano_greedy_search(pose_dict, init_depth)
+        # Persist the fused mesh used to initialize GS, without visualization boxes.
+        import trimesh
+        trimesh.Trimesh(vertices=self.vertices.T.cpu().numpy(), faces=self.faces.T.cpu().numpy(),
+                        vertex_colors=(self.colors.T.cpu().numpy()*255).clip(0, 255).astype(np.uint8),
+                        process=False).export(os.path.join(self.save_path, 'fused_scene.ply'))
+        np.save(os.path.join(self.save_path, 'initial_distance.npy'), init_depth.cpu().numpy())
 
         panorama_pil = functions.tensor_to_pil(panorama_tensor.unsqueeze(0))
         panorama_pil.save(f"{self.save_path}/panorama_tensor.png")
@@ -1324,38 +1121,4 @@ class GenerationPipeline(torch.nn.Module):
         self.train_GS()
         outfile = self.gaussians.save_ply(os.path.join(self.GS_render_dir, '3DGS.ply'))
 
-        # Eval GS
-        self.pano_pose, self.poses = self.load_camera_poses(self.pano_center_offset)
-        evaldata = {
-            'camera_angle_x': self.cam.fov[0],
-            'W': self.W,
-            'H': self.H,
-            'frames': [],
-        }
-
-        for i in range(len(self.poses)):
-            gt_img = inpainted_img
-
-            pose_44 = self.poses[i].clone()
-            pose_44 = pose_44.float()
-            pose_44[0:1,:] *= -1
-            pose_44[1:2,:] *= -1
-
-            Rw2c = pose_44[:3,:3].cpu().numpy()
-            Tw2c = pose_44[:3,3:].cpu().numpy()
-            yz_reverse = np.array([[1,0,0], [0,-1,0], [0,0,-1]])
-
-            Rc2w = np.matmul(yz_reverse, Rw2c).T
-            Tc2w = -np.matmul(Rc2w, np.matmul(yz_reverse, Tw2c))
-            Pc2w = np.concatenate((Rc2w, Tc2w), axis=1)
-            Pc2w = np.concatenate((Pc2w, np.array([[0,0,0,1]])), axis=0)                  
-
-            evaldata['frames'].append({
-                'image': functions.tensor_to_pil(gt_img),
-                'transform_matrix': Pc2w.tolist(), 
-                'fovx': focal2fov(self.H / 2, self.W),
-                'mesh_pose': self.poses[i].clone()
-            })
-        eval_GS_cams = loadCamerasFromData(evaldata, self.opt.white_background)
-        self.eval_GS(eval_GS_cams)
-        self.GS2pano_roampose(inpainted_panos_and_poses, self.gaussians, self.opt, self.background)
+        self.evaluate_views()

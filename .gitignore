@@ -40,3 +40,27 @@ stitch_diffusion/vae/*
 stitch_diffusion/.config/*
 **/build/*
 **/dist/*
+
+# Local initialization scripts
+/gen_refpano.py
+/gen_ref_pano.py
+
+# External native dependencies
+/modules/pano_depth_estimators/
+/src/Infusion/gaussian_splatting/submodules/
+*.c
+*.cc
+*.cpp
+*.cxx
+*.h
+*.hh
+*.hpp
+*.hxx
+*.inl
+*.cu
+*.cuh
+*.cmake
+CMakeLists.txt
+CMakeCache.txt
+CMakeFiles/
+Makefile

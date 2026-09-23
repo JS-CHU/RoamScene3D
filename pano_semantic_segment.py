@@ -1,80 +1,101 @@
+"""SAM proposals + frozen CLIP + conservative depth-verified graph grounding."""
+import json
 import os
-import os.path as ops
-import argparse
 import cv2
-# from pano_segment.local_utils.log_util import init_logger
+import numpy as np
+import torch
+from PIL import Image
 from pano_segment.local_utils.config_utils import parse_config_utils
 from pano_segment.models import build_sam_clip_text_ins_segmentor
-
-def init_args():
-    """
-
-    :return:
-    """
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--insseg_cfg_path', type=str, default='./config/insseg.yaml')
-    parser.add_argument('--text', type=str, default=None)
-    parser.add_argument('--cls_score_thresh', type=float, default=None)
-    parser.add_argument('--save_dir', type=str, default='./output/insseg')
-    parser.add_argument('--use_text_prefix', action='store_true')
-
-    return parser.parse_args()
+from pano_segment.models.clip import tokenize
+from utils.scene_geometry import panorama_points
+from utils.semantic_grounding import validate_graph, grounding_text, mask_geometry, ground_graph
 
 
-class PanoSemanticSegmentor(object):
-    
+class PanoSemanticSegmentor:
     def __init__(self, image_path, scene_graph):
         self.image_path = image_path
-        self.scene_graph = scene_graph
-        self.major_list = None
-        self.object_list = self._extract_objects_names()
-        self.use_text_prefix = True
-        insseg_cfg_path = './pano_segment/config/insseg.yaml'
-        self.insseg_cfg = parse_config_utils.Config(config_path=insseg_cfg_path)
-        self.debug = True
+        self.scene_graph = validate_graph(scene_graph)
+        self.bindings = {}
+        self.verified_relations = []
+        self.anchor_ids = []
 
-    def _extract_objects_names(self):
-            """提取场景图中的对象名称列表"""
-            if self.scene_graph is not None:
-                objects: dict = self.scene_graph['objects']
-                self.major_list = self.scene_graph['major']
-                # filtered_objects = {k: v for k, v in objects.items() if 'major' not in k.lower()}
-                return list(objects.keys())
-            else:
-                return None
-    
-    def segment(self, save_dir):
-
-        input_image_name = ops.split(self.image_path)[1]
-
-        if self.major_list is not None:
-            unique_labels = self.object_list
-        else:
-            unique_labels = None
-        # unique_labels = None
-        segmentor = build_sam_clip_text_ins_segmentor(cfg=self.insseg_cfg)
-
-        # 让返回的结果中包含类别信息
-        ret = segmentor.seg_image(self.image_path, unique_label=unique_labels, use_text_prefix=self.use_text_prefix)
-        semantic_map = ret['masks']['map']
-        instance_num = len(ret['masks']['bbox_cls_names'])
-        # semantic_map = None
-        # instance_num = 0
-        if self.debug:
-            # save cluster result
-            # save_dir = './output/debug/pano_seg'
-            os.makedirs(save_dir, exist_ok=True)
-            ori_image_save_path = ops.join(save_dir, input_image_name)
-            cv2.imwrite(ori_image_save_path, ret['source'])
-            mask_save_path = ops.join(save_dir, '{:s}_insseg_mask.png'.format(input_image_name.split('.')[0]))
-            cv2.imwrite(mask_save_path, ret['ins_seg_mask'])
-            mask_add_save_path = ops.join(save_dir, '{:s}_insseg_add.png'.format(input_image_name.split('.')[0]))
-            cv2.imwrite(mask_add_save_path, ret['ins_seg_add'])
-
-        return semantic_map, instance_num
-
-
-if __name__ == "__main__":
-    # 创建输出目录
-    args = init_args()
-    segmentor = PanoSemanticSegmentor()
+    @torch.no_grad()
+    def segment(self, save_dir, depth, image=None):
+        os.makedirs(save_dir, exist_ok=True)
+        if image is None:
+            image = np.asarray(Image.open(self.image_path).convert('RGB').resize((depth.shape[1], depth.shape[0])))
+        nodes = list(self.scene_graph['objects'])
+        label_map = np.zeros(depth.shape, dtype=np.int32)
+        if not self.scene_graph['major']:
+            return label_map, 0
+        cfg = parse_config_utils.Config(config_path='./pano_segment/config/insseg.yaml')
+        model = build_sam_clip_text_ins_segmentor(cfg=cfg)
+        model.clip_model.eval().requires_grad_(False)
+        # Shift the seam so a physical object crossing it can be proposed intact.
+        candidates = []
+        for shift in (0, image.shape[1]//2):
+            proposals = model._generate_sam_mask(np.roll(image, shift, axis=1))
+            for mask, stability in zip(proposals['segmentations'], proposals['stability_scores']):
+                candidates.append((np.roll(mask, -shift, axis=1).astype(bool), stability))
+        # Suppress duplicate physical masks, never merge all masks of a category.
+        masks = []
+        mask_bounds = []
+        for mask, _ in sorted(candidates, key=lambda item: -item[1]):
+            if not mask.any():
+                continue
+            yy, xx = np.where(mask)
+            area = len(xx)
+            bounds = (yy.min(), yy.max()+1, xx.min(), xx.max()+1, area)
+            duplicate = False
+            for old, (oy0, oy1, ox0, ox1, old_area) in zip(masks, mask_bounds):
+                y0, y1 = max(bounds[0], oy0), min(bounds[1], oy1)
+                x0, x1 = max(bounds[2], ox0), min(bounds[3], ox1)
+                # Exact cheap upper bound before touching full-resolution masks.
+                upper = min(max(y1-y0, 0)*max(x1-x0, 0), area, old_area)
+                if upper/max(area, old_area) <= .8:
+                    continue
+                intersection = np.count_nonzero(mask[y0:y1, x0:x1] & old[y0:y1, x0:x1])
+                if intersection/(area+old_area-intersection) > .8:
+                    duplicate = True
+                    break
+            if duplicate:
+                continue
+            masks.append(mask)
+            mask_bounds.append(bounds)
+        del candidates
+        if not masks:
+            return label_map, 0
+        texts = [grounding_text(self.scene_graph, node) for node in nodes]
+        text_features = model.clip_model.encode_text(tokenize(texts, truncate=True).to(model.device)).float()
+        text_features = torch.nn.functional.normalize(text_features, dim=-1)
+        image_features = []
+        for mask in masks:
+            # Circular crop keeps seam-crossing instances contiguous for CLIP.
+            cols = np.where(mask.any(0))[0]
+            gaps = np.diff(np.r_[cols, cols[0]+mask.shape[1]])
+            start = cols[(int(gaps.argmax())+1) % len(cols)]
+            rolled_mask = np.roll(mask, -int(start), axis=1)
+            rolled_image = np.roll(image, -int(start), axis=1)
+            yy, xx = np.where(rolled_mask)
+            masked = rolled_image * rolled_mask[..., None]
+            crop = masked[yy.min():yy.max()+1, xx.min():xx.max()+1]
+            tensor = model.clip_preprocess(Image.fromarray(crop)).unsqueeze(0).to(model.device)
+            image_features.append(model.clip_model.encode_image(tensor).float())
+        image_features = torch.nn.functional.normalize(torch.cat(image_features), dim=-1)
+        unary = (text_features @ image_features.T).cpu().numpy()
+        points = panorama_points(depth)
+        geometries = [mask_geometry(points, m) for m in masks]
+        self.bindings, self.verified_relations = ground_graph(self.scene_graph, unary, geometries)
+        self.anchor_ids = [n for n in self.scene_graph['major'] if n in self.bindings]
+        self.anchor_geometries = [geometries[self.bindings[n]] for n in self.anchor_ids]
+        # Labels are only an optional visualization; actual boxes use immutable masks.
+        for label, node in enumerate(self.anchor_ids, 1):
+            label_map[masks[self.bindings[node]]] = label
+        np.savez_compressed(os.path.join(save_dir, 'bound_masks.npz'),
+                            **{n: masks[j] for n, j in self.bindings.items()})
+        with open(os.path.join(save_dir, 'grounding.json'), 'w') as f:
+            json.dump({'bindings': self.bindings, 'anchors': self.anchor_ids,
+                       'unresolved': [n for n in nodes if n not in self.bindings],
+                       'verified_relations': self.verified_relations}, f, indent=2)
+        return label_map, len(self.anchor_ids)

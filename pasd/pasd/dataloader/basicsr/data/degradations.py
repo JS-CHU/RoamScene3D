@@ -116,7 +116,6 @@ def bivariate_Gaussian(kernel_size, sig_x, sig_y, theta, grid=None, isotropic=Tr
 def bivariate_generalized_Gaussian(kernel_size, sig_x, sig_y, theta, beta, grid=None, isotropic=True):
     """Generate a bivariate generalized Gaussian kernel.
 
-    ``Paper: Parameter Estimation For Multivariate Generalized Gaussian Distributions``
 
     In the isotropic mode, only `sig_x` is used. `sig_y` and `theta` is ignored.
 

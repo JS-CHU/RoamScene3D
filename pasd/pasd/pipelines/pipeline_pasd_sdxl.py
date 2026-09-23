@@ -628,7 +628,7 @@ class StableDiffusionXLControlNetPipeline(
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # eta controls DDIM sampling stochasticity.
         # and should be between [0, 1]
 
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
@@ -1017,9 +1017,7 @@ class StableDiffusionXLControlNetPipeline(
     def clip_skip(self):
         return self._clip_skip
 
-    # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-    # corresponds to doing no classifier free guidance.
+    # Enable classifier-free guidance when guidance_scale exceeds 1.
     @property
     def do_classifier_free_guidance(self):
         return self._guidance_scale > 1 and self.unet.config.time_cond_proj_dim is None
@@ -1156,7 +1154,7 @@ class StableDiffusionXLControlNetPipeline(
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
+                Controls DDIM sampling stochasticity. Only applies
                 to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
                 A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
@@ -1205,32 +1203,23 @@ class StableDiffusionXLControlNetPipeline(
                 The percentage of total steps at which the ControlNet stops applying.
             original_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
                 If `original_size` is not the same as `target_size` the image will appear to be down- or upsampled.
-                `original_size` defaults to `(height, width)` if not specified. Part of SDXL's micro-conditioning as
-                explained in section 2.2 of
-                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952).
+                `original_size` defaults to `(height, width)` if not specified. Part of SDXL's micro-conditioning.
             crops_coords_top_left (`Tuple[int]`, *optional*, defaults to (0, 0)):
                 `crops_coords_top_left` can be used to generate an image that appears to be "cropped" from the position
                 `crops_coords_top_left` downwards. Favorable, well-centered images are usually achieved by setting
-                `crops_coords_top_left` to (0, 0). Part of SDXL's micro-conditioning as explained in section 2.2 of
-                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952).
+                `crops_coords_top_left` to (0, 0). Part of SDXL's micro-conditioning.
             target_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
                 For most cases, `target_size` should be set to the desired height and width of the generated image. If
-                not specified it will default to `(height, width)`. Part of SDXL's micro-conditioning as explained in
-                section 2.2 of [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952).
+                not specified it will default to `(height, width)`. Part of SDXL's micro-conditioning.
             negative_original_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
-                To negatively condition the generation process based on a specific image resolution. Part of SDXL's
-                micro-conditioning as explained in section 2.2 of
-                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952). For more
+                To negatively condition the generation process based on a specific image resolution. Part of SDXL's micro-conditioning. For more
                 information, refer to this issue thread: https://github.com/huggingface/diffusers/issues/4208.
             negative_crops_coords_top_left (`Tuple[int]`, *optional*, defaults to (0, 0)):
-                To negatively condition the generation process based on a specific crop coordinates. Part of SDXL's
-                micro-conditioning as explained in section 2.2 of
-                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952). For more
+                To negatively condition the generation process based on a specific crop coordinates. Part of SDXL's micro-conditioning. For more
                 information, refer to this issue thread: https://github.com/huggingface/diffusers/issues/4208.
             negative_target_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
                 To negatively condition the generation process based on a target image resolution. It should be as same
-                as the `target_size` for most cases. Part of SDXL's micro-conditioning as explained in section 2.2 of
-                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952). For more
+                as the `target_size` for most cases. Part of SDXL's micro-conditioning. For more
                 information, refer to this issue thread: https://github.com/huggingface/diffusers/issues/4208.
             clip_skip (`int`, *optional*):
                 Number of layers to be skipped from CLIP while computing the prompt embeddings. A value of 1 means that

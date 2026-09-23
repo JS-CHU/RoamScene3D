@@ -20,7 +20,7 @@ class GSParams:
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 4990 #2990
+        self.position_lr_max_steps = 5000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05 #0.05
         self.scaling_lr = 0.005
@@ -31,7 +31,7 @@ class GSParams:
         self.opacity_reset_interval = 999999 #3000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
-        self.densify_grad_threshold = 0.0001
+        self.densify_grad_threshold = 0.0002
 
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
